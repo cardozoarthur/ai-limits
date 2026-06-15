@@ -2,7 +2,7 @@
 name = "ai-limits"
 version = "0.1.0"
 edition = "2024"
-description = "Show Codex and Gemini account usage limits from the command line"
+description = "Show local AI CLI account usage limits from the command line"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/cardozoarthur/ai-limits"

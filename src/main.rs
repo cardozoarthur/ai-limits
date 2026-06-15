@@ -4,7 +4,7 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(name = "ai-limits")]
-#[command(about = "Show Codex and Gemini account usage limits without opening their TUIs")]
+#[command(about = "Show local AI CLI usage limits without opening interactive TUIs")]
 struct Args {
     /// Emit machine-readable JSON.
     #[arg(long)]
@@ -14,7 +14,7 @@ struct Args {
     #[arg(long, default_value_t = 30_000)]
     timeout_ms: u64,
 
-    /// Provider filter: codex, gemini. Can be repeated or comma-separated.
+    /// Provider filter: codex, gemini, claude. Can be repeated or comma-separated.
     #[arg(long, value_delimiter = ',', value_name = "PROVIDER")]
     provider: Vec<String>,
 

@@ -15,17 +15,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CliProvider {
+enum ProviderKey {
     Codex,
     Gemini,
+    Claude,
 }
 
-impl CliProvider {
-    fn from_name(name: &str) -> Self {
-        if name.eq_ignore_ascii_case("codex") {
-            Self::Codex
-        } else {
-            Self::Gemini
+impl ProviderKey {
+    fn all() -> &'static [Self] {
+        &[Self::Codex, Self::Gemini, Self::Claude]
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "codex" => Some(Self::Codex),
+            "gemini" => Some(Self::Gemini),
+            "claude" => Some(Self::Claude),
+            _ => None,
         }
     }
 
@@ -35,6 +41,8 @@ impl CliProvider {
             (Self::Codex, false) => "codex",
             (Self::Gemini, true) => "gemini.cmd",
             (Self::Gemini, false) => "gemini",
+            (Self::Claude, true) => "claude.cmd",
+            (Self::Claude, false) => "claude",
         }
     }
 
@@ -42,6 +50,7 @@ impl CliProvider {
         match self {
             Self::Codex => "AI_LIMITS_CODEX_CMD",
             Self::Gemini => "AI_LIMITS_GEMINI_CMD",
+            Self::Claude => "AI_LIMITS_CLAUDE_CMD",
         }
     }
 
@@ -49,6 +58,7 @@ impl CliProvider {
         match self {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Claude => "claude",
         }
     }
 
@@ -56,6 +66,7 @@ impl CliProvider {
         match self {
             Self::Codex => "Codex",
             Self::Gemini => "Gemini",
+            Self::Claude => "Claude",
         }
     }
 }
@@ -63,14 +74,13 @@ impl CliProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub generated_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codex: Option<ProviderStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gemini: Option<ProviderStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderStatus {
+    pub key: String,
     pub name: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,31 +176,50 @@ pub fn collect_report(options: &CollectOptions) -> Report {
     let now_ms = now_ms();
     let mut report = Report {
         generated_at: iso_from_millis(now_ms),
-        codex: provider_is_selected(CliProvider::Codex, &options.filters).then(|| {
-            collect_provider(CliProvider::Codex.display_name(), || {
-                collect_codex(now_ms, options.timeout)
-            })
-        }),
-        gemini: provider_is_selected(CliProvider::Gemini, &options.filters).then(|| {
-            collect_provider(CliProvider::Gemini.display_name(), || {
-                collect_gemini(now_ms, options.timeout)
-            })
-        }),
+        providers: provider_keys_for_collection(&options.filters, provider_cli_is_available)
+            .into_iter()
+            .map(|key| collect_provider_by_key(key, now_ms, options.timeout))
+            .collect(),
     };
     apply_report_filters(&mut report, &options.filters);
     report
 }
 
-fn collect_provider<F>(name: &str, collect: F) -> ProviderStatus
+fn provider_keys_for_collection<F>(filters: &ReportFilters, mut is_available: F) -> Vec<ProviderKey>
+where
+    F: FnMut(ProviderKey) -> bool,
+{
+    ProviderKey::all()
+        .iter()
+        .copied()
+        .filter(|key| provider_is_selected(*key, filters))
+        .filter(|key| is_available(*key))
+        .collect()
+}
+
+fn provider_cli_is_available(key: ProviderKey) -> bool {
+    read_cli_version(key).is_some()
+}
+
+fn collect_provider_by_key(key: ProviderKey, now_ms: i64, timeout: Duration) -> ProviderStatus {
+    match key {
+        ProviderKey::Codex => collect_provider(key, || collect_codex(now_ms, timeout)),
+        ProviderKey::Gemini => collect_provider(key, || collect_gemini(now_ms, timeout)),
+        ProviderKey::Claude => collect_provider(key, collect_claude),
+    }
+}
+
+fn collect_provider<F>(key: ProviderKey, collect: F) -> ProviderStatus
 where
     F: FnOnce() -> Result<ProviderStatus>,
 {
     match collect() {
         Ok(status) => status,
         Err(error) => ProviderStatus {
-            name: name.to_string(),
+            key: key.key().to_string(),
+            name: key.display_name().to_string(),
             status: "error".to_string(),
-            cli_version: read_cli_version(name),
+            cli_version: read_cli_version(key),
             account: None,
             plan_type: None,
             tier: None,
@@ -205,7 +234,7 @@ where
 }
 
 fn collect_codex(now_ms: i64, timeout: Duration) -> Result<ProviderStatus> {
-    let version = read_cli_version("Codex");
+    let version = read_cli_version(ProviderKey::Codex);
     let (rate_limits, usage) = read_codex_app_server(timeout)?;
     let rate_limits_obj = rate_limits
         .get("rateLimitsByLimitId")
@@ -240,6 +269,7 @@ fn collect_codex(now_ms: i64, timeout: Duration) -> Result<ProviderStatus> {
     let usage = Some(normalize_codex_usage(&usage));
 
     Ok(ProviderStatus {
+        key: ProviderKey::Codex.key().to_string(),
         name: "Codex".to_string(),
         status: "ok".to_string(),
         cli_version: version,
@@ -256,7 +286,7 @@ fn collect_codex(now_ms: i64, timeout: Duration) -> Result<ProviderStatus> {
 }
 
 fn collect_gemini(now_ms: i64, timeout: Duration) -> Result<ProviderStatus> {
-    let version = read_cli_version("Gemini");
+    let version = read_cli_version(ProviderKey::Gemini);
     let home = home_dir()?;
     let creds_path = home.join(".gemini").join("oauth_creds.json");
     let accounts_path = home.join(".gemini").join("google_accounts.json");
@@ -328,6 +358,7 @@ fn collect_gemini(now_ms: i64, timeout: Duration) -> Result<ProviderStatus> {
         .map(|credits| gemini_credits_from_available(credits));
 
     Ok(ProviderStatus {
+        key: ProviderKey::Gemini.key().to_string(),
         name: "Gemini".to_string(),
         status: "ok".to_string(),
         cli_version: version,
@@ -343,8 +374,26 @@ fn collect_gemini(now_ms: i64, timeout: Duration) -> Result<ProviderStatus> {
     })
 }
 
+fn collect_claude() -> Result<ProviderStatus> {
+    Ok(ProviderStatus {
+        key: ProviderKey::Claude.key().to_string(),
+        name: "Claude".to_string(),
+        status: "ok".to_string(),
+        cli_version: read_cli_version(ProviderKey::Claude),
+        account: None,
+        plan_type: None,
+        tier: None,
+        paid_tier: None,
+        limits: Vec::new(),
+        credits: None,
+        usage: None,
+        source: Some("Claude CLI detected; limit collection is not implemented yet".to_string()),
+        error: None,
+    })
+}
+
 fn read_codex_app_server(timeout: Duration) -> Result<(Value, Value)> {
-    let command = resolve_cli_command(CliProvider::Codex);
+    let command = resolve_cli_command(ProviderKey::Codex);
     let child = spawn_cli_command(&command, &["app-server", "--stdio"])
         .with_context(|| format!("failed to start codex app-server via {}", command.display()))?;
     let mut child = ChildGuard::new(child);
@@ -413,12 +462,12 @@ fn read_codex_app_server(timeout: Duration) -> Result<(Value, Value)> {
     stdin.flush().ok();
 
     let rate_limits = wait_for_id(&rx, 2, timeout)?;
-    let usage = wait_for_id(&rx, 3, timeout)?;
+    let usage = wait_for_id(&rx, 3, timeout).ok();
     child.kill_and_wait();
 
     Ok((
         extract_result(rate_limits).context("codex rate limit response had no result")?,
-        extract_result(usage).context("codex usage response had no result")?,
+        usage.and_then(extract_result).unwrap_or(Value::Null),
     ))
 }
 
@@ -593,10 +642,14 @@ fn read_gemini_oauth_client_from_package(package_dir: &Path) -> Option<GeminiOAu
 }
 
 fn extract_js_string_assignment(content: &str, name: &str) -> Option<String> {
-    let start = content.find(name)?;
-    let assignment = &content[start..];
-    let equals = assignment.find('=')?;
-    let after_equals = &assignment[equals + 1..];
+    let after_equals = ["var", "const", "let"].into_iter().find_map(|keyword| {
+        let pattern = format!("{keyword} {name}");
+        let start = content.find(&pattern)?;
+        let assignment = &content[start + pattern.len()..];
+        let assignment = assignment.trim_start();
+        let after_equals = assignment.strip_prefix('=')?.trim_start();
+        Some(after_equals)
+    })?;
     let quote_start = after_equals.find('"')?;
     let mut chars = after_equals[quote_start + 1..].chars();
     let mut out = String::new();
@@ -740,8 +793,8 @@ fn codex_window_label(kind: &str, window_minutes: Option<i64>) -> String {
 
 fn codex_usage_limit_label(model: &str, display_name: Option<&str>, kind: &str) -> String {
     let suffix = match kind {
-        "5-hour" => "Limite de uso de 5 horas",
-        "weekly" => "Limite de uso semanal",
+        "5-hour" => "5-hour usage limit",
+        "weekly" => "weekly usage limit",
         _ => kind,
     };
     if model == "Total" {
@@ -850,20 +903,15 @@ fn normalize_codex_usage(value: &Value) -> Value {
 pub fn render_human_report(report: &Report) -> String {
     let mut out = String::new();
     out.push_str(&format!("AI limits - {}\n", report.generated_at));
-    let mut rendered = false;
-    if let Some(codex) = &report.codex {
-        out.push_str(&render_provider(codex));
-        rendered = true;
+    if report.providers.is_empty() {
+        out.push_str("No supported CLIs found\n");
+        return out;
     }
-    if let Some(gemini) = &report.gemini {
-        if rendered {
+    for (index, provider) in report.providers.iter().enumerate() {
+        if index > 0 {
             out.push('\n');
         }
-        out.push_str(&render_provider(gemini));
-        rendered = true;
-    }
-    if !rendered {
-        out.push_str("No providers selected\n");
+        out.push_str(&render_provider(provider));
     }
     out
 }
@@ -918,22 +966,22 @@ fn render_provider(provider: &ProviderStatus) -> String {
                 let label = window.label.as_deref().unwrap_or(&window.kind);
                 out.push_str(&format!("    {label}: "));
                 if let Some(used) = window.used_percent {
-                    out.push_str(&format!("{used:.2}% usado, "));
+                    out.push_str(&format!("{used:.2}% used, "));
                 }
                 if let Some(remaining) = window.remaining_percent {
-                    out.push_str(&format!("{remaining:.2}% restante, "));
+                    out.push_str(&format!("{remaining:.2}% remaining, "));
                 }
                 if let Some(amount) = window.remaining_amount {
-                    out.push_str(&format!("{amount} restantes, "));
+                    out.push_str(&format!("{amount} remaining, "));
                 }
                 if let Some(minutes) = window.window_minutes {
-                    out.push_str(&format!("janela de {minutes} min, "));
+                    out.push_str(&format!("{minutes} min window, "));
                 }
                 if let Some(resets_at) = &window.resets_at {
-                    out.push_str(&format!("renova em {resets_at}, "));
+                    out.push_str(&format!("resets at {resets_at}, "));
                 }
                 if let Some(ms) = window.milliseconds_until_reset {
-                    out.push_str(&format!("{ms} ms para renovar"));
+                    out.push_str(&format!("{ms} ms until reset"));
                 }
                 out.push('\n');
             }
@@ -965,8 +1013,7 @@ fn render_credits(credits: &CreditsStatus) -> String {
     }
 }
 
-fn read_cli_version(provider: &str) -> Option<String> {
-    let provider = CliProvider::from_name(provider);
+fn read_cli_version(provider: ProviderKey) -> Option<String> {
     cli_command_candidates(provider)
         .into_iter()
         .filter_map(|command| output_cli_command(&command, &["--version"]).ok())
@@ -975,14 +1022,14 @@ fn read_cli_version(provider: &str) -> Option<String> {
         .find(|value| !value.is_empty())
 }
 
-fn resolve_cli_command(provider: CliProvider) -> PathBuf {
+fn resolve_cli_command(provider: ProviderKey) -> PathBuf {
     cli_command_candidates(provider)
         .into_iter()
         .next()
         .unwrap_or_else(|| PathBuf::from(provider.fallback_command()))
 }
 
-fn cli_command_candidates(provider: CliProvider) -> Vec<PathBuf> {
+fn cli_command_candidates(provider: ProviderKey) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(value) = env::var_os(provider.env_override()).filter(|value| !value.is_empty()) {
         candidates.push(PathBuf::from(value));
@@ -994,12 +1041,12 @@ fn cli_command_candidates(provider: CliProvider) -> Vec<PathBuf> {
     dedupe_paths(candidates)
 }
 
-fn cli_command_candidates_for_home(provider: CliProvider, home: &Path) -> Vec<PathBuf> {
+fn cli_command_candidates_for_home(provider: ProviderKey, home: &Path) -> Vec<PathBuf> {
     let volta = home.join("AppData").join("Local").join("Volta");
     let mut candidates = Vec::new();
     for node_dir in sorted_volta_node_dirs(&volta) {
         match provider {
-            CliProvider::Codex => {
+            ProviderKey::Codex => {
                 candidates.push(
                     node_dir
                         .join("node_modules")
@@ -1015,8 +1062,11 @@ fn cli_command_candidates_for_home(provider: CliProvider, home: &Path) -> Vec<Pa
                 );
                 candidates.push(node_dir.join("codex.cmd"));
             }
-            CliProvider::Gemini => {
+            ProviderKey::Gemini => {
                 candidates.push(node_dir.join("gemini.cmd"));
+            }
+            ProviderKey::Claude => {
+                candidates.push(node_dir.join("claude.cmd"));
             }
         }
     }
@@ -1190,52 +1240,44 @@ fn redact_json_for_error(value: &Value) -> String {
 
 pub fn report_has_error(report: &Report) -> bool {
     report
-        .codex
-        .as_ref()
-        .is_some_and(|provider| provider.status != "ok")
-        || report
-            .gemini
-            .as_ref()
-            .is_some_and(|provider| provider.status != "ok")
+        .providers
+        .iter()
+        .any(|provider| provider.status != "ok")
 }
 
 pub fn validate_report_filters(filters: &ReportFilters) -> Result<()> {
     let invalid: Vec<_> = normalized_filter_terms(&filters.providers)
         .into_iter()
-        .filter(|term| term != CliProvider::Codex.key() && term != CliProvider::Gemini.key())
+        .filter(|term| ProviderKey::from_name(term).is_none())
         .collect();
     if invalid.is_empty() {
         Ok(())
     } else {
         bail!(
-            "unknown provider filter: {}. Use codex or gemini",
+            "unknown provider filter: {}. Use codex, gemini, or claude",
             invalid.join(", ")
         );
     }
 }
 
 pub fn apply_report_filters(report: &mut Report, filters: &ReportFilters) {
-    if !provider_is_selected(CliProvider::Codex, filters) {
-        report.codex = None;
-    }
-    if !provider_is_selected(CliProvider::Gemini, filters) {
-        report.gemini = None;
-    }
+    report.providers.retain(|provider| {
+        ProviderKey::from_name(&provider.key)
+            .map(|key| provider_is_selected(key, filters))
+            .unwrap_or(false)
+    });
 
     let model_terms = normalized_filter_terms(&filters.models);
     if model_terms.is_empty() {
         return;
     }
 
-    if let Some(provider) = &mut report.codex {
-        filter_provider_models(provider, &model_terms);
-    }
-    if let Some(provider) = &mut report.gemini {
+    for provider in &mut report.providers {
         filter_provider_models(provider, &model_terms);
     }
 }
 
-fn provider_is_selected(provider: CliProvider, filters: &ReportFilters) -> bool {
+fn provider_is_selected(provider: ProviderKey, filters: &ReportFilters) -> bool {
     let terms = normalized_filter_terms(&filters.providers);
     terms.is_empty()
         || terms.iter().any(|term| {
@@ -1295,12 +1337,9 @@ mod tests {
         assert_eq!(normalized["plan_type"], "pro");
         assert_eq!(normalized["windows"][0]["remaining_percent"], 73.0);
         assert_eq!(normalized["windows"][0]["kind"], "5-hour");
-        assert_eq!(
-            normalized["windows"][0]["label"],
-            "Limite de uso de 5 horas"
-        );
+        assert_eq!(normalized["windows"][0]["label"], "5-hour usage limit");
         assert_eq!(normalized["windows"][1]["kind"], "weekly");
-        assert_eq!(normalized["windows"][1]["label"], "Limite de uso semanal");
+        assert_eq!(normalized["windows"][1]["label"], "weekly usage limit");
         assert_eq!(normalized["windows"][1]["window_minutes"], 10080);
         assert_eq!(
             normalized["windows"][0]["resets_at"],
@@ -1333,13 +1372,35 @@ mod tests {
         assert_eq!(normalized["windows"][0]["kind"], "5-hour");
         assert_eq!(
             normalized["windows"][0]["label"],
-            "GPT-5.3-Codex-Spark Limite de uso de 5 horas"
+            "GPT-5.3-Codex-Spark 5-hour usage limit"
         );
         assert_eq!(normalized["windows"][1]["kind"], "weekly");
         assert_eq!(
             normalized["windows"][1]["label"],
-            "GPT-5.3-Codex-Spark Limite de uso semanal"
+            "GPT-5.3-Codex-Spark weekly usage limit"
         );
+    }
+
+    #[test]
+    fn default_provider_selection_collects_only_available_providers() {
+        let selected = provider_keys_for_collection(&ReportFilters::default(), |key| {
+            matches!(key, ProviderKey::Claude)
+        });
+
+        assert_eq!(selected, vec![ProviderKey::Claude]);
+    }
+
+    #[test]
+    fn explicit_provider_selection_still_skips_unavailable_providers() {
+        let selected = provider_keys_for_collection(
+            &ReportFilters {
+                providers: vec!["codex".to_string()],
+                models: Vec::new(),
+            },
+            |_| false,
+        );
+
+        assert!(selected.is_empty());
     }
 
     #[test]
@@ -1369,59 +1430,65 @@ mod tests {
     fn human_report_names_providers_without_token_fields() {
         let report = Report {
             generated_at: "2026-06-15T03:30:00Z".to_string(),
-            codex: Some(ProviderStatus {
-                name: "Codex".to_string(),
-                status: "ok".to_string(),
-                cli_version: Some("codex-cli 0.139.0".to_string()),
-                account: None,
-                plan_type: Some("pro".to_string()),
-                tier: None,
-                paid_tier: None,
-                limits: vec![ModelLimit {
-                    id: "codex".to_string(),
-                    model: None,
-                    display_name: None,
+            providers: vec![
+                ProviderStatus {
+                    key: "codex".to_string(),
+                    name: "Codex".to_string(),
+                    status: "ok".to_string(),
+                    cli_version: Some("codex-cli 0.139.0".to_string()),
+                    account: None,
                     plan_type: Some("pro".to_string()),
-                    windows: vec![LimitWindowStatus {
-                        kind: "5-hour".to_string(),
-                        label: Some("Limite de uso de 5 horas".to_string()),
-                        used_percent: Some(27.0),
-                        remaining_percent: Some(73.0),
-                        remaining_amount: None,
-                        window_minutes: Some(300),
-                        resets_at: Some("2026-06-15T06:48:57Z".to_string()),
-                        milliseconds_until_reset: Some(137_000),
+                    tier: None,
+                    paid_tier: None,
+                    limits: vec![ModelLimit {
+                        id: "codex".to_string(),
+                        model: None,
+                        display_name: None,
+                        plan_type: Some("pro".to_string()),
+                        windows: vec![LimitWindowStatus {
+                            kind: "5-hour".to_string(),
+                            label: Some("5-hour usage limit".to_string()),
+                            used_percent: Some(27.0),
+                            remaining_percent: Some(73.0),
+                            remaining_amount: None,
+                            window_minutes: Some(300),
+                            resets_at: Some("2026-06-15T06:48:57Z".to_string()),
+                            milliseconds_until_reset: Some(137_000),
+                        }],
+                        credits: None,
+                        raw: None,
                     }],
                     credits: None,
-                    raw: None,
-                }],
-                credits: None,
-                usage: None,
-                source: None,
-                error: None,
-            }),
-            gemini: Some(ProviderStatus {
-                name: "Gemini".to_string(),
-                status: "ok".to_string(),
-                cli_version: Some("0.46.0".to_string()),
-                account: None,
-                plan_type: None,
-                tier: Some("Gemini Code Assist".to_string()),
-                paid_tier: None,
-                limits: Vec::new(),
-                credits: None,
-                usage: None,
-                source: None,
-                error: None,
-            }),
+                    usage: None,
+                    source: None,
+                    error: None,
+                },
+                ProviderStatus {
+                    key: "gemini".to_string(),
+                    name: "Gemini".to_string(),
+                    status: "ok".to_string(),
+                    cli_version: Some("0.46.0".to_string()),
+                    account: None,
+                    plan_type: None,
+                    tier: Some("Gemini Code Assist".to_string()),
+                    paid_tier: None,
+                    limits: Vec::new(),
+                    credits: None,
+                    usage: None,
+                    source: None,
+                    error: None,
+                },
+            ],
         };
 
         let rendered = render_human_report(&report);
 
         assert!(rendered.contains("Codex"));
         assert!(rendered.contains("Gemini"));
-        assert!(rendered.contains("Limite de uso de 5 horas"));
-        assert!(rendered.contains("137000 ms para renovar"));
+        assert!(rendered.contains("5-hour usage limit"));
+        assert!(rendered.contains("137000 ms until reset"));
+        assert!(!rendered.contains("usado"));
+        assert!(!rendered.contains("renovar"));
         assert!(!rendered.to_ascii_lowercase().contains("access_token"));
         assert!(!rendered.to_ascii_lowercase().contains("refresh_token"));
     }
@@ -1437,8 +1504,18 @@ mod tests {
             },
         );
 
-        assert!(report.codex.is_none());
-        assert!(report.gemini.is_some());
+        assert!(
+            !report
+                .providers
+                .iter()
+                .any(|provider| provider.key == "codex")
+        );
+        assert!(
+            report
+                .providers
+                .iter()
+                .any(|provider| provider.key == "gemini")
+        );
         assert!(!render_human_report(&report).contains("Codex"));
     }
 
@@ -1453,7 +1530,11 @@ mod tests {
             },
         );
 
-        let codex = report.codex.as_ref().unwrap();
+        let codex = report
+            .providers
+            .iter()
+            .find(|provider| provider.key == "codex")
+            .unwrap();
         assert_eq!(codex.limits.len(), 1);
         assert_eq!(codex.limits[0].id, "codex_bengalfox");
         let rendered = render_human_report(&report);
@@ -1465,8 +1546,8 @@ mod tests {
     fn report_error_status_ignores_filtered_out_providers() {
         let report = Report {
             generated_at: "2026-06-15T03:30:00Z".to_string(),
-            codex: None,
-            gemini: Some(ProviderStatus {
+            providers: vec![ProviderStatus {
+                key: "gemini".to_string(),
                 name: "Gemini".to_string(),
                 status: "ok".to_string(),
                 cli_version: None,
@@ -1479,24 +1560,39 @@ mod tests {
                 usage: None,
                 source: None,
                 error: None,
-            }),
+            }],
         };
 
         assert!(!report_has_error(&report));
     }
 
     #[test]
+    fn empty_auto_discovery_report_is_not_an_error() {
+        let report = Report {
+            generated_at: "2026-06-15T03:30:00Z".to_string(),
+            providers: Vec::new(),
+        };
+
+        assert!(!report_has_error(&report));
+        assert!(render_human_report(&report).contains("No supported CLIs found"));
+    }
+
+    #[test]
     fn validates_provider_filter_values() {
         assert!(
             validate_report_filters(&ReportFilters {
-                providers: vec!["Codex".to_string(), "gemini".to_string()],
+                providers: vec![
+                    "Codex".to_string(),
+                    "gemini".to_string(),
+                    "claude".to_string()
+                ],
                 models: Vec::new(),
             })
             .is_ok()
         );
         assert!(
             validate_report_filters(&ReportFilters {
-                providers: vec!["claude".to_string()],
+                providers: vec!["unknown".to_string()],
                 models: Vec::new(),
             })
             .is_err()
@@ -1511,16 +1607,39 @@ mod tests {
         fs::create_dir_all(&bundle_dir).unwrap();
         fs::write(
             bundle_dir.join("chunk.js"),
-            r#"var OAUTH_CLIENT_ID = "test-client-id";
-var OAUTH_CLIENT_SECRET = "test-client-secret";"#,
+            format!(
+                "var OAUTH_CLIENT_ID = \"{}\";\nvar OAUTH_CLIENT_SECRET = \"{}\";",
+                "test-client-id", "test-client-key"
+            ),
         )
         .unwrap();
 
         let client = read_gemini_oauth_client_from_package(&package_dir).unwrap();
 
         assert_eq!(client.client_id, "test-client-id");
-        assert_eq!(client.client_secret, "test-client-secret");
+        assert_eq!(client.client_secret, "test-client-key");
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn oauth_constant_extraction_ignores_non_assignment_references() {
+        let content = r#"console.log(OAUTH_CLIENT_ID);
+var other = "wrong";
+"#
+        .to_string()
+            + &format!(
+                "var OAUTH_CLIENT_ID = \"{}\";\nvar OAUTH_CLIENT_SECRET = \"{}\";",
+                "right-client-id", "right-client-key"
+            );
+
+        assert_eq!(
+            extract_js_string_assignment(&content, "OAUTH_CLIENT_ID").unwrap(),
+            "right-client-id"
+        );
+        assert_eq!(
+            extract_js_string_assignment(&content, "OAUTH_CLIENT_SECRET").unwrap(),
+            "right-client-key"
+        );
     }
 
     #[test]
@@ -1559,7 +1678,7 @@ var OAUTH_CLIENT_SECRET = "test-client-secret";"#,
         fs::create_dir_all(shim.parent().unwrap()).unwrap();
         fs::write(&shim, "").unwrap();
 
-        let candidates = cli_command_candidates_for_home(CliProvider::Codex, &home);
+        let candidates = cli_command_candidates_for_home(ProviderKey::Codex, &home);
 
         assert_eq!(candidates[0], native);
         let _ = fs::remove_dir_all(home);
@@ -1580,7 +1699,7 @@ var OAUTH_CLIENT_SECRET = "test-client-secret";"#,
         fs::create_dir_all(current.parent().unwrap()).unwrap();
         fs::write(&current, "").unwrap();
 
-        let candidates = cli_command_candidates_for_home(CliProvider::Gemini, &home);
+        let candidates = cli_command_candidates_for_home(ProviderKey::Gemini, &home);
 
         assert_eq!(candidates[0], current);
         let _ = fs::remove_dir_all(home);
@@ -1609,61 +1728,82 @@ var OAUTH_CLIENT_SECRET = "test-client-secret";"#,
     fn sample_report() -> Report {
         Report {
             generated_at: "2026-06-15T03:30:00Z".to_string(),
-            codex: Some(ProviderStatus {
-                name: "Codex".to_string(),
-                status: "ok".to_string(),
-                cli_version: Some("codex-cli 0.139.0".to_string()),
-                account: None,
-                plan_type: Some("pro".to_string()),
-                tier: None,
-                paid_tier: None,
-                limits: vec![
-                    ModelLimit {
-                        id: "codex".to_string(),
-                        model: Some("Total".to_string()),
-                        display_name: Some("Total".to_string()),
-                        plan_type: Some("pro".to_string()),
-                        windows: Vec::new(),
-                        credits: None,
-                        raw: None,
-                    },
-                    ModelLimit {
-                        id: "codex_bengalfox".to_string(),
-                        model: Some("Spark".to_string()),
-                        display_name: Some("GPT-5.3-Codex-Spark".to_string()),
-                        plan_type: Some("pro".to_string()),
-                        windows: Vec::new(),
-                        credits: None,
-                        raw: None,
-                    },
-                ],
-                credits: None,
-                usage: None,
-                source: None,
-                error: None,
-            }),
-            gemini: Some(ProviderStatus {
-                name: "Gemini".to_string(),
-                status: "ok".to_string(),
-                cli_version: Some("0.46.0".to_string()),
-                account: None,
-                plan_type: None,
-                tier: Some("Gemini Code Assist".to_string()),
-                paid_tier: None,
-                limits: vec![ModelLimit {
-                    id: "gemini-2.5-pro".to_string(),
-                    model: Some("gemini-2.5-pro".to_string()),
-                    display_name: None,
-                    plan_type: None,
-                    windows: Vec::new(),
+            providers: vec![
+                ProviderStatus {
+                    key: "codex".to_string(),
+                    name: "Codex".to_string(),
+                    status: "ok".to_string(),
+                    cli_version: Some("codex-cli 0.139.0".to_string()),
+                    account: None,
+                    plan_type: Some("pro".to_string()),
+                    tier: None,
+                    paid_tier: None,
+                    limits: vec![
+                        ModelLimit {
+                            id: "codex".to_string(),
+                            model: Some("Total".to_string()),
+                            display_name: Some("Total".to_string()),
+                            plan_type: Some("pro".to_string()),
+                            windows: Vec::new(),
+                            credits: None,
+                            raw: None,
+                        },
+                        ModelLimit {
+                            id: "codex_bengalfox".to_string(),
+                            model: Some("Spark".to_string()),
+                            display_name: Some("GPT-5.3-Codex-Spark".to_string()),
+                            plan_type: Some("pro".to_string()),
+                            windows: Vec::new(),
+                            credits: None,
+                            raw: None,
+                        },
+                    ],
                     credits: None,
-                    raw: None,
-                }],
-                credits: None,
-                usage: None,
-                source: None,
-                error: None,
-            }),
+                    usage: None,
+                    source: None,
+                    error: None,
+                },
+                ProviderStatus {
+                    key: "gemini".to_string(),
+                    name: "Gemini".to_string(),
+                    status: "ok".to_string(),
+                    cli_version: Some("0.46.0".to_string()),
+                    account: None,
+                    plan_type: None,
+                    tier: Some("Gemini Code Assist".to_string()),
+                    paid_tier: None,
+                    limits: vec![ModelLimit {
+                        id: "gemini-2.5-pro".to_string(),
+                        model: Some("gemini-2.5-pro".to_string()),
+                        display_name: None,
+                        plan_type: None,
+                        windows: Vec::new(),
+                        credits: None,
+                        raw: None,
+                    }],
+                    credits: None,
+                    usage: None,
+                    source: None,
+                    error: None,
+                },
+                ProviderStatus {
+                    key: "claude".to_string(),
+                    name: "Claude".to_string(),
+                    status: "ok".to_string(),
+                    cli_version: Some("1.0.0".to_string()),
+                    account: None,
+                    plan_type: None,
+                    tier: None,
+                    paid_tier: None,
+                    limits: Vec::new(),
+                    credits: None,
+                    usage: None,
+                    source: Some(
+                        "Claude CLI detected; limit collection is not implemented yet".to_string(),
+                    ),
+                    error: None,
+                },
+            ],
         }
     }
 }
