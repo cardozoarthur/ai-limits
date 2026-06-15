@@ -1,0 +1,9 @@
+/target
+.env
+.env.*
+*.log
+*.tmp
+*.bak
+*.local
+ai-limits.json
+report.json
